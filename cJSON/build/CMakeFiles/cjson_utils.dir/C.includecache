@@ -1,0 +1,36 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/zyl/Polar-AFL/cJSON/cJSON.h
+stddef.h
+-
+
+/home/zyl/Polar-AFL/cJSON/cJSON_Utils.c
+ctype.h
+-
+string.h
+-
+stdlib.h
+-
+stdio.h
+-
+limits.h
+-
+math.h
+-
+float.h
+-
+math.h
+-
+cJSON_Utils.h
+/home/zyl/Polar-AFL/cJSON/cJSON_Utils.h
+
+/home/zyl/Polar-AFL/cJSON/cJSON_Utils.h
+cJSON.h
+/home/zyl/Polar-AFL/cJSON/cJSON.h
+

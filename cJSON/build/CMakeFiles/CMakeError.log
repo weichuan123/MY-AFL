@@ -1,0 +1,51 @@
+Performing C SOURCE FILE Test FLAG_SUPPORTED_Wcomma failed with the following output:
+Change Dir: /home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp
+
+Run Build Command:"/usr/bin/make" "cmTC_19de3/fast"
+/usr/bin/make -f CMakeFiles/cmTC_19de3.dir/build.make CMakeFiles/cmTC_19de3.dir/build
+make[1]: Entering directory '/home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp'
+Building C object CMakeFiles/cmTC_19de3.dir/src.c.o
+/usr/bin/cc   -std=c89 -pedantic -Wall -Wextra -Werror -Wstrict-prototypes -Wwrite-strings -Wshadow -Winit-self -Wcast-align -Wformat=2 -Wmissing-prototypes -Wstrict-overflow=2 -Wcast-qual -Wundef -Wswitch-default -Wconversion -Wc++-compat -fstack-protector-strong -DFLAG_SUPPORTED_Wcomma   -Wcomma -o CMakeFiles/cmTC_19de3.dir/src.c.o   -c /home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp/src.c
+cc: error: unrecognized command line option '-Wcomma'; did you mean '-Wcomment'?
+CMakeFiles/cmTC_19de3.dir/build.make:65: recipe for target 'CMakeFiles/cmTC_19de3.dir/src.c.o' failed
+make[1]: *** [CMakeFiles/cmTC_19de3.dir/src.c.o] Error 1
+make[1]: Leaving directory '/home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp'
+Makefile:126: recipe for target 'cmTC_19de3/fast' failed
+make: *** [cmTC_19de3/fast] Error 2
+
+Source file was:
+int main(void) { return 0; }
+Performing C SOURCE FILE Test FLAG_SUPPORTED_Wmissingvariabledeclarations failed with the following output:
+Change Dir: /home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp
+
+Run Build Command:"/usr/bin/make" "cmTC_1ccca/fast"
+/usr/bin/make -f CMakeFiles/cmTC_1ccca.dir/build.make CMakeFiles/cmTC_1ccca.dir/build
+make[1]: Entering directory '/home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp'
+Building C object CMakeFiles/cmTC_1ccca.dir/src.c.o
+/usr/bin/cc   -std=c89 -pedantic -Wall -Wextra -Werror -Wstrict-prototypes -Wwrite-strings -Wshadow -Winit-self -Wcast-align -Wformat=2 -Wmissing-prototypes -Wstrict-overflow=2 -Wcast-qual -Wundef -Wswitch-default -Wconversion -Wc++-compat -fstack-protector-strong -Wdouble-promotion -Wparentheses -Wformat-overflow -Wunused-macros -DFLAG_SUPPORTED_Wmissingvariabledeclarations   -Wmissing-variable-declarations -o CMakeFiles/cmTC_1ccca.dir/src.c.o   -c /home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp/src.c
+cc: error: unrecognized command line option '-Wmissing-variable-declarations'; did you mean '-Wmissing-declarations'?
+CMakeFiles/cmTC_1ccca.dir/build.make:65: recipe for target 'CMakeFiles/cmTC_1ccca.dir/src.c.o' failed
+make[1]: *** [CMakeFiles/cmTC_1ccca.dir/src.c.o] Error 1
+make[1]: Leaving directory '/home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp'
+Makefile:126: recipe for target 'cmTC_1ccca/fast' failed
+make: *** [cmTC_1ccca/fast] Error 2
+
+Source file was:
+int main(void) { return 0; }
+Performing C SOURCE FILE Test FLAG_SUPPORTED_Wusedbutmarkedunused failed with the following output:
+Change Dir: /home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp
+
+Run Build Command:"/usr/bin/make" "cmTC_3944a/fast"
+/usr/bin/make -f CMakeFiles/cmTC_3944a.dir/build.make CMakeFiles/cmTC_3944a.dir/build
+make[1]: Entering directory '/home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp'
+Building C object CMakeFiles/cmTC_3944a.dir/src.c.o
+/usr/bin/cc   -std=c89 -pedantic -Wall -Wextra -Werror -Wstrict-prototypes -Wwrite-strings -Wshadow -Winit-self -Wcast-align -Wformat=2 -Wmissing-prototypes -Wstrict-overflow=2 -Wcast-qual -Wundef -Wswitch-default -Wconversion -Wc++-compat -fstack-protector-strong -Wdouble-promotion -Wparentheses -Wformat-overflow -Wunused-macros -DFLAG_SUPPORTED_Wusedbutmarkedunused   -Wused-but-marked-unused -o CMakeFiles/cmTC_3944a.dir/src.c.o   -c /home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp/src.c
+cc: error: unrecognized command line option '-Wused-but-marked-unused'
+CMakeFiles/cmTC_3944a.dir/build.make:65: recipe for target 'CMakeFiles/cmTC_3944a.dir/src.c.o' failed
+make[1]: *** [CMakeFiles/cmTC_3944a.dir/src.c.o] Error 1
+make[1]: Leaving directory '/home/zyl/Polar-AFL/cJSON/build/CMakeFiles/CMakeTmp'
+Makefile:126: recipe for target 'cmTC_3944a/fast' failed
+make: *** [cmTC_3944a/fast] Error 2
+
+Source file was:
+int main(void) { return 0; }
