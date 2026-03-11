@@ -26,11 +26,6 @@ jobs:
           cd /tmp/preeny
           make desock
 
-      - name: Prepare input corpus
-        run: |
-          mkdir -p libiec61850-1.5.1/build/examples/server_example_basic_io/inputs/seed_bin_origin
-          echo 'seed' > libiec61850-1.5.1/build/examples/server_example_basic_io/inputs/seed_bin_origin/seed.bin
-
       - name: Run AFL fuzzing for limited time
         run: |
           cd libiec61850-1.5.1/build/examples/server_example_basic_io
