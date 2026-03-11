@@ -1,0 +1,48 @@
+name: AFL Fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch to fuzz'
+        required: true
+        default: 'dev'
+
+jobs:
+  fuzzing:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libtool autoconf automake git
+
+      - name: Build AFL tools from source
+        run: |
+          make
+
+      - name: Build preeny (for desock.so)
+        run: |
+          git clone https://github.com/zardus/preeny.git /tmp/preeny
+          cd /tmp/preeny
+          make desock
+
+      - name: Run AFL fuzzing for limited time
+        run: |
+          cd libiec61850-1.5.1/build/examples/server_example_basic_io
+          mkdir -p outputs_test
+          timeout 3600 bash -c 'LD_PRELOAD=/tmp/preeny/src/desock.so ../../../../afl-fuzz -i inputs/seed_bin_origin -o outputs_test/ -m none -P ./server_example_basic_io' || true
+        continue-on-error: true
+
+      - name: Archive fuzzing results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-findings
+          path: libiec61850-1.5.1/build/examples/server_example_basic_io/outputs_test/
