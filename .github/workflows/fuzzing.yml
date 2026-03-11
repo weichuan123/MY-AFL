@@ -75,6 +75,7 @@ jobs:
         run: |
             cd libiec61850-1.5.1/build/examples/server_example_basic_io
             mkdir -p outputs_test logs
+            chmod +x ./server_example_basic_io
             export AFL_NO_UI=1
 
             timeout 3600 bash -c '
