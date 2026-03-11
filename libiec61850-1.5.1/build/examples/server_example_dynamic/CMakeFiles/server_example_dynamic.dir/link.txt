@@ -1,0 +1,1 @@
+/usr/local/bin/afl-gcc -fprofile-arcs -ftest-coverage CMakeFiles/server_example_dynamic.dir/server_example_dynamic.c.o -o server_example_dynamic  ../../src/libiec61850.a ../../hal/libhal.a -lpthread -lm -lrt 
