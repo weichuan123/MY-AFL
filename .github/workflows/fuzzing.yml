@@ -26,7 +26,9 @@ jobs:
 
       - name: Build and install cJSON from source
         run: |
+          git clone https://github.com/DaveGamble/cJSON.git
           cd cJSON
+          mkdir build
           cd build
           cmake .. -DENABLE_CJSON_UTILS=On -DENABLE_CJSON_TEST=Off -DCMAKE_INSTALL_PREFIX=/usr
           make
