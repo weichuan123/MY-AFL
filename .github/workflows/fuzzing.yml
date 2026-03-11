@@ -52,16 +52,6 @@ jobs:
           make -C /tmp/preeny/src desock.so
           ls -lah /tmp/preeny/src/desock.so
 
-      - name: Check target binary
-        shell: bash
-        run: |
-            cd libiec61850-1.5.1/build/examples/server_example_basic_io
-            pwd
-            ls -lah
-            test -e ./server_example_basic_io
-            test -x ./server_example_basic_io
-            file ./server_example_basic_io
-
       - name: Prepare runner for AFL crash detection
         shell: bash
         run: |
