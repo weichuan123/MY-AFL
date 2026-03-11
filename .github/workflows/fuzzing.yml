@@ -83,7 +83,7 @@ jobs:
                 -i inputs/seed_bin_origin \
                 -o outputs_test/ \
                 -m none \
-                -P ./server_example_basic_io
+                -- ./server_example_basic_io
             ' 2>&1 | tee logs/afl-fuzz-live.log
 
             test ${PIPESTATUS[0]} -eq 0 -o ${PIPESTATUS[0]} -eq 124
