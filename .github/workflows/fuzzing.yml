@@ -44,7 +44,7 @@ jobs:
 
       - name: Build AFL tools from source
         run: |
-          make -j"$(nproc)"
+          sudo make -j"$(nproc)"
 
       - name: Build preeny desock.so
         run: |
