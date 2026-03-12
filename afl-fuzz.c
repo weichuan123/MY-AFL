@@ -295,7 +295,7 @@ struct queue_entry {
   u8* hot_hits;                        /* Hit risk path times*/
 
   struct queue_entry *next,           /* Next element, if any             */
-                     *next_100;       /* 100 elements ahead               */
+                     *next_100,       /* 100 elements ahead               */
                      *next_cksum;     /* Same exec_cksum bucket next -New */
 
 };
