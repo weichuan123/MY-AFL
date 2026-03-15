@@ -123,7 +123,7 @@ jobs:
           chmod +x ./unit-test-server
           export AFL_NO_UI=1
 
-          afl_input_dir="inputs/seed_bin_origin"
+          afl_input_dir="inputs"
           if [ -d outputs_test/queue ]; then
             afl_input_dir="-"
             echo "Continuing AFL with existing outputs_test corpus"
