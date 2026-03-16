@@ -128,12 +128,23 @@ jobs:
 
           test -f "${{ github.workspace }}/.deps/preeny/desock.so"
 
-          afl_input_dir="inputs/seed_bin_origin"
+          seed_dir="${{ github.workspace }}/libiec61850-1.5.1/build/examples/server_example_basic_io/inputs/seed_bin_origin"
+
+          if [ -d "$seed_dir" ]; then
+            afl_input_dir="$seed_dir"
+          else
+            echo "Seed directory not found."
+            echo "Checked:"
+            echo "  $seed_dir"
+            echo "  $alt_seed_dir"
+            exit 1
+          fi
+
           if [ -d outputs_test/queue ]; then
             afl_input_dir="-"
             echo "Continuing AFL with existing outputs_test corpus"
           else
-            echo "Starting AFL from seed corpus"
+            echo "Starting AFL from seed corpus: $afl_input_dir"
           fi
 
           cleanup() {
@@ -160,22 +171,22 @@ jobs:
           MON_PID=$!
 
           set +e
-          timeout 21300 bash -c '
+          timeout 21300 env \
             LD_PRELOAD="${{ github.workspace }}/.deps/preeny/desock.so" \
             ../../../../afl-fuzz \
               -i "$afl_input_dir" \
               -o outputs_test/ \
               -m none \
-              -- ./server_example_basic_io
-          ' 2>&1 | tee "logs/afl-fuzz-live-seg-${{ inputs.run_segment }}.log"
+              -- ./server_example_basic_io \
+            2>&1 | tee "logs/afl-fuzz-live-seg-${{ inputs.run_segment }}.log"
           rc=${PIPESTATUS[0]}
           set -e
 
           echo "afl/timeout exit code: $rc"
 
-          if [ -f outputs_test/default/plot_data ]; then
+          if [ -f outputs_test/plot_data ]; then
             echo "===== plot_data tail ====="
-            tail -n 20 outputs_test/default/plot_data | tee "logs/plot_data_tail-seg-${{ inputs.run_segment }}.log"
+            tail -n 20 outputs_test/plot_data | tee "logs/plot_data_tail-seg-${{ inputs.run_segment }}.log"
           fi
 
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
