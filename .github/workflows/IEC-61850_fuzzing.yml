@@ -212,7 +212,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzzing-plot-data-seg-${{ inputs.run_segment }}
-          path: libiec61850-1.5.1/build/examples/server_example_basic_io/outputs_test/default/plot_data
+          path: libiec61850-1.5.1/build/examples/server_example_basic_io/outputs_test/plot_data
           if-no-files-found: warn
 
       - name: Upload fuzzing results archive
