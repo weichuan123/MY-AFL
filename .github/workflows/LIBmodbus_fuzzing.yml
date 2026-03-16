@@ -81,16 +81,19 @@ jobs:
         id: cache-preeny
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.deps/preeny/desock.so
-          key: ${{ runner.os }}-preeny-<pin-a-commit>
+          path: ${{ github.workspace }}/.deps/preeny
+          key: ${{ runner.os }}-preeny-zardus-master-v1
 
       - name: Build preeny desock.so
         if: steps.cache-preeny.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           git clone --depth 1 https://github.com/zardus/preeny.git /tmp/preeny
           make -C /tmp/preeny/src desock.so
           mkdir -p "${{ github.workspace }}/.deps/preeny"
           cp /tmp/preeny/src/desock.so "${{ github.workspace }}/.deps/preeny/desock.so"
+          test -f "${{ github.workspace }}/.deps/preeny/desock.so"
+          ls -lah "${{ github.workspace }}/.deps/preeny/desock.so"
 
       - name: Restore AFL state from previous segment
         if: ${{ inputs.resume_run_id != '' && inputs.resume_artifact_name != '' }}
@@ -156,7 +159,8 @@ jobs:
 
           set +e
           timeout 21300 env \
-            LD_PRELOAD=/tmp/preeny/src/desock.so \
+            LD_PRELOAD="${{ github.workspace }}/.deps/preeny/desock.so" \
+            test -f "${{ github.workspace }}/.deps/preeny/desock.so" \
             ../../afl-fuzz \
               -i "$afl_input_dir" \
               -o outputs_test/ \
