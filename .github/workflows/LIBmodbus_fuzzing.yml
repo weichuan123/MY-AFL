@@ -126,6 +126,8 @@ jobs:
           chmod +x ./unit-test-server
           export AFL_NO_UI=1
 
+          test -f "${{ github.workspace }}/.deps/preeny/desock.so"
+
           afl_input_dir="inputs"
           if [ -d outputs_test/queue ]; then
             afl_input_dir="-"
@@ -160,7 +162,6 @@ jobs:
           set +e
           timeout 21300 env \
             LD_PRELOAD="${{ github.workspace }}/.deps/preeny/desock.so" \
-            test -f "${{ github.workspace }}/.deps/preeny/desock.so" \
             ../../afl-fuzz \
               -i "$afl_input_dir" \
               -o outputs_test/ \
