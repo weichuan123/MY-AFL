@@ -139,7 +139,7 @@ jobs:
           set +e
           timeout 21300 env \
             LD_PRELOAD="${{ github.workspace }}/.deps/preeny/desock.so" \
-            ../../afl-fuzz \
+            ../afl-fuzz \
               -i "$afl_input_dir" \
               -o outputs_test/ \
               -m none \

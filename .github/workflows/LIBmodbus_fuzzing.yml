@@ -101,7 +101,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          cd libmodbus-3.1.10/tests
+          cd libmodbus-3.1.10
           rm -rf outputs_test
           mkdir -p /tmp/afl-resume
           gh run download "${{ inputs.resume_run_id }}" \
@@ -121,7 +121,7 @@ jobs:
       - name: Run AFL fuzzing for limited time
         shell: bash
         run: |
-          cd libmodbus-3.1.10/tests
+          cd libmodbus-3.1.10
           mkdir -p outputs_test logs
           chmod +x ./unit-test-server
           export AFL_NO_UI=1
@@ -139,7 +139,7 @@ jobs:
           set +e
           timeout 21300 env \
             LD_PRELOAD="${{ github.workspace }}/.deps/preeny/desock.so" \
-            ../../afl-fuzz \
+            ../afl-fuzz \
               -i "$afl_input_dir" \
               -o outputs_test/ \
               -m none \
@@ -163,7 +163,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          cd libmodbus-3.1.10/tests
+          cd libmodbus-3.1.10
           echo "===== final fuzzer_stats ====="
           if [ -f outputs_test/fuzzer_stats ]; then
             cat outputs_test/fuzzer_stats
@@ -184,7 +184,7 @@ jobs:
             SMTP_PASS: ${{ secrets.SMTP_PASS }}
             ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
-            cd libmodbus-3.1.10/tests
+            cd libmodbus-3.1.10
 
             if [ ! -f outputs_test/fuzzer_stats ]; then
             echo "outputs_test/fuzzer_stats not found, skip email alert"
@@ -250,7 +250,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          cd libmodbus-3.1.10/tests
+          cd libmodbus-3.1.10
           tar -czf modbus-findings.tar.gz outputs_test
 
       - name: Upload fuzzing log
@@ -258,14 +258,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: modbus-log-seg-${{ inputs.run_segment }}
-          path: libmodbus-3.1.10/tests/logs/
+          path: libmodbus-3.1.10/logs/
 
       - name: Upload plot_data
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: modbus-plot-data-seg-${{ inputs.run_segment }}
-          path: libmodbus-3.1.10/tests/outputs_test/plot_data
+          path: libmodbus-3.1.10/outputs_test/plot_data
           if-no-files-found: warn
 
       - name: Upload fuzzing results archive
@@ -273,7 +273,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: modbus-findings-seg-${{ inputs.run_segment }}
-          path: libmodbus-3.1.10/tests/modbus-findings.tar.gz
+          path: libmodbus-3.1.10/modbus-findings.tar.gz
 
       - name: Trigger next fuzzing segment
         if: ${{ success() && fromJSON(inputs.run_segment) < fromJSON(inputs.max_segments) }}
