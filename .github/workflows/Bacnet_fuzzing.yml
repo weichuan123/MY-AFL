@@ -1,5 +1,5 @@
-name: IEC-61850 Fuzzing
-run-name: IEC fuzzing [${{ inputs.run_segment }}/${{ inputs.max_segments }}] on ${{ inputs.target_branch }}
+name: BACNET Fuzzing
+run-name: BACNET fuzzing [${{ inputs.run_segment }}/${{ inputs.max_segments }}] on ${{ inputs.target_branch }}
 
 on:
   workflow_dispatch:
@@ -77,37 +77,19 @@ jobs:
         run: |
           sudo make -j"$(nproc)"
 
-      - name: Restore preeny cache
-        id: cache-preeny
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.deps/preeny
-          key: ${{ runner.os }}-preeny-zardus-master-v1
-
-      - name: Build preeny desock.so
-        if: steps.cache-preeny.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/zardus/preeny.git /tmp/preeny
-          make -C /tmp/preeny/src desock.so
-          mkdir -p "${{ github.workspace }}/.deps/preeny"
-          cp /tmp/preeny/src/desock.so "${{ github.workspace }}/.deps/preeny/desock.so"
-          test -f "${{ github.workspace }}/.deps/preeny/desock.so"
-          ls -lah "${{ github.workspace }}/.deps/preeny/desock.so"
-
       - name: Restore AFL state from previous segment
         if: ${{ inputs.resume_run_id != '' && inputs.resume_artifact_name != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          cd libiec61850-1.5.1/build/examples/server_example_basic_io
+          cd bacnet
           rm -rf outputs_test
           mkdir -p /tmp/afl-resume
           gh run download "${{ inputs.resume_run_id }}" \
             -n "${{ inputs.resume_artifact_name }}" \
             -D /tmp/afl-resume
-          tar -xzf /tmp/afl-resume/iec61850-findings.tar.gz
+          tar -xzf /tmp/afl-resume/bacnet-findings.tar.gz
           test -d outputs_test/queue
           echo "Resumed AFL queue from run ${{ inputs.resume_run_id }} / artifact ${{ inputs.resume_artifact_name }}"
 
@@ -121,40 +103,26 @@ jobs:
       - name: Run AFL fuzzing for limited time
         shell: bash
         run: |
-          cd libiec61850-1.5.1/build/examples/server_example_basic_io
+          cd bacnet
           mkdir -p outputs_test logs
-          chmod +x ./server_example_basic_io
+          chmod +x ./fuzz-afl
           export AFL_NO_UI=1
 
-          test -f "${{ github.workspace }}/.deps/preeny/desock.so"
-
-          seed_dir="${{ github.workspace }}/libiec61850-1.5.1/build/examples/server_example_basic_io/inputs/seed_bin_origin"
-
-          if [ -d "$seed_dir" ]; then
-            afl_input_dir="$seed_dir"
-          else
-            echo "Seed directory not found."
-            echo "Checked:"
-            echo "  $seed_dir"
-            echo "  $alt_seed_dir"
-            exit 1
-          fi
-
+          afl_input_dir="inputs"
           if [ -d outputs_test/queue ]; then
             afl_input_dir="-"
             echo "Continuing AFL with existing outputs_test corpus"
           else
-            echo "Starting AFL from seed corpus: $afl_input_dir"
+            echo "Starting AFL from seed corpus"
           fi
 
           set +e
           timeout 21300 env \
-            LD_PRELOAD="${{ github.workspace }}/.deps/preeny/desock.so" \
-            ../../../../afl-fuzz \
+            ../afl-fuzz \
               -i "$afl_input_dir" \
               -o outputs_test/ \
               -m none \
-              -- ./server_example_basic_io \
+              -- ./fuzz-afl \
             2>&1 | tee "logs/afl-fuzz-live-seg-${{ inputs.run_segment }}.log"
           rc=${PIPESTATUS[0]}
           set -e
@@ -174,7 +142,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          cd libiec61850-1.5.1/build/examples/server_example_basic_io
+          cd bacnet
           echo "===== final fuzzer_stats ====="
           if [ -f outputs_test/fuzzer_stats ]; then
             cat outputs_test/fuzzer_stats
@@ -195,7 +163,7 @@ jobs:
             SMTP_PASS: ${{ secrets.SMTP_PASS }}
             ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
-            cd libiec61850-1.5.1/build/examples/server_example_basic_io
+            cd bacnet
 
             if [ ! -f outputs_test/fuzzer_stats ]; then
             echo "outputs_test/fuzzer_stats not found, skip email alert"
@@ -261,30 +229,30 @@ jobs:
         if: always()
         shell: bash
         run: |
-          cd libiec61850-1.5.1/build/examples/server_example_basic_io
-          tar -czf iec61850-findings.tar.gz outputs_test
+          cd bacnet
+          tar -czf bacnet-findings.tar.gz outputs_test
 
       - name: Upload fuzzing log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: iec61850-log-seg-${{ inputs.run_segment }}
-          path: libiec61850-1.5.1/build/examples/server_example_basic_io/logs/
+          name: bacnet-log-seg-${{ inputs.run_segment }}
+          path: bacnet/logs/
 
       - name: Upload plot_data
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: iec61850-plot-data-seg-${{ inputs.run_segment }}
-          path: libiec61850-1.5.1/build/examples/server_example_basic_io/outputs_test/plot_data
+          name: bacnet-plot-data-seg-${{ inputs.run_segment }}
+          path: bacnet/outputs_test/plot_data
           if-no-files-found: warn
 
       - name: Upload fuzzing results archive
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: iec61850-findings-seg-${{ inputs.run_segment }}
-          path: libiec61850-1.5.1/build/examples/server_example_basic_io/iec61850-findings.tar.gz
+          name: bacnet-findings-seg-${{ inputs.run_segment }}
+          path: bacnet/bacnet-findings.tar.gz
 
       - name: Trigger next fuzzing segment
         if: ${{ success() && fromJSON(inputs.run_segment) < fromJSON(inputs.max_segments) }}
@@ -293,7 +261,7 @@ jobs:
         shell: bash
         run: |
           next_segment=$(( ${{ inputs.run_segment }} + 1 ))
-          current_artifact="iec61850-findings-seg-${{ inputs.run_segment }}"
+          current_artifact="bacnet-findings-seg-${{ inputs.run_segment }}"
 
           echo "Triggering segment ${next_segment}/${{ inputs.max_segments }} based on current AFL outputs"
 
@@ -302,7 +270,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/IEC-61850_fuzzing.yml/dispatches" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/Bacnet_fuzzing.yml/dispatches" \
             -d @- <<EOF
           {
             "ref": "dev",
