@@ -1,0 +1,1 @@
+/usr/local/bin/afl-gcc -fprofile-arcs -ftest-coverage CMakeFiles/goose_subscriber_example.dir/goose_subscriber_example.c.o -o goose_subscriber_example  ../../src/libiec61850.a ../../hal/libhal.a -lpthread -lm -lrt 

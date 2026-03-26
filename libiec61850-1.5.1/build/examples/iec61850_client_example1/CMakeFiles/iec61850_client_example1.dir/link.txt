@@ -1,0 +1,1 @@
+/usr/local/bin/afl-gcc -fprofile-arcs -ftest-coverage CMakeFiles/iec61850_client_example1.dir/client_example1.c.o -o iec61850_client_example1  ../../src/libiec61850.a ../../hal/libhal.a -lpthread -lm -lrt 

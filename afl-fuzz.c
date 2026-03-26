@@ -236,6 +236,29 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
+/* ----------------------------- */
+/* LinUCB scheduling definitions */
+/* ----------------------------- */
+
+#define LIN_STATES            3
+#define LIN_DIM               13
+
+#define LIN_ALPHA_STATE1      0.55
+#define LIN_ALPHA_STATE2      0.35
+#define LIN_ALPHA_STATE3      0.20
+
+#define LIN_REWARD_CLAMP      8.0
+#define LIN_FRESH_BONUS       0.20
+#define LIN_STAGE3_STRIDE     16   /* must be power of two */
+
+#define CKSUM_HT_BITS         14
+#define CKSUM_HT_SIZE         (1U << CKSUM_HT_BITS)
+
+#define LIN_REBUILD_INTERVAL  64
+#define LIN_TOPK              32
+#define LIN_BURST_MIN         1
+#define LIN_BURST_MAX         3
+
 struct queue_entry {
 
   u8* fname;                          /* File name for the test case      */
@@ -249,26 +272,40 @@ struct queue_entry {
       var_behavior,                   /* Variable behavior?               */
       state,                          /* Was fuzzed dutring state 2?      */
       favored,                        /* Currently favored?               */
-      fs_redundant;                   /* Marked as redundant in the fs?   */
+      fs_redundant,                   /* Marked as redundant in the fs?   */
+      cksum_registered,               /* Registered into cksum hash?      */
+      recent_found;                   /* Recently produced new path/cov   */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
       fuzz_level,                     /* Number of fuzzing iterations     */
-      pending_favored,                /* Pending favored seed            */
-      exec_cksum;                     /* Checksum of the execution trace  */
+      pending_favored,                /* Pending favored seed             */
+      exec_cksum,                     /* Checksum of the execution trace  */
+      queue_id,                       /* Stable queue id for LinUCB       */
+      lin_selects;                    /* Number of bandit selections      */
+
+  u16 det_attempts,                   /* Deterministic attempts           */
+      det_finds;                      /* Deterministic yields             */
+  u8  det_mode;                       /* 0=unknown,1=full,2=light,3=skip  */
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */
       depth,                          /* Path depth                       */
-      n_fuzz;                         /* Number of fuzz, does not overflow */
+      n_fuzz,                         /* Number of fuzz in path family    */
+      discovered_at;                  /* Timestamp when seed was queued   */
 
+  double lin_reward_ema,              /* Smoothed reward                  */
+         lin_last_ucb,                /* Last UCB score                   */
+         lin_last_mean,               /* Last LinUCB mean                 */
+         lin_last_reward;             /* Last observed reward             */
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
-  u8* hot_hits;                        /* Hit risk path times*/
+  u8* hot_hits;                       /* Hit risk path times              */
 
   struct queue_entry *next,           /* Next element, if any             */
-                     *next_100;       /* 100 elements ahead               */
+                     *next_100,       /* 100 elements ahead               */
+                     *next_cksum;     /* Same exec_cksum bucket next      */
 
 };
 
@@ -279,6 +316,58 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
+
+enum {
+  DET_SKIP = 0,
+  DET_LIGHT,
+  DET_FULL
+};
+
+struct linucb_model {
+  double a_inv[LIN_DIM][LIN_DIM];
+  double b[LIN_DIM];
+  double theta[LIN_DIM];
+  double alpha;
+  u64    pulls;
+};
+
+struct linucb_episode {
+  struct queue_entry* seed;
+  u8     state;
+  u8     active;
+  double x[LIN_DIM];
+
+  u64 before_queued_paths;
+  u64 before_queued_with_cov;
+  u64 before_unique_crashes;
+  u64 before_unique_hangs;
+  u64 before_total_execs;
+
+  u32 perf_score;
+};
+
+struct lin_pick {
+  struct queue_entry* q;
+  double score;
+};
+
+static struct lin_pick lin_topk[LIN_TOPK];
+static u32 lin_topk_cnt;
+static u32 lin_select_since_rebuild;
+static u32 lin_cached_state;
+static u64 lin_last_rebuild_queued_paths;
+static u8  lin_cache_valid;
+static u32 lin_seed_burst_left;
+
+static struct linucb_model lin_models[LIN_STATES];
+static struct linucb_episode lin_ep;
+
+static struct queue_entry* cksum_heads[CKSUM_HT_SIZE];
+
+static u8  lin_mode_active;
+static u8  lin_selected_state;
+static u32 lin_cycle_budget;
+/* end */
 
 struct extra_data {
   u8* data;                           /* Dictionary token data            */
@@ -800,16 +889,18 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 // }
 
 /* Append new test case to the queue. */
-
 static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
-  q->fname        = fname;
-  q->len          = len;
-  q->depth        = cur_depth + 1;
-  q->passed_det   = passed_det;
-  q->n_fuzz       = 1;
+  q->fname         = fname;
+  q->len           = len;
+  q->depth         = cur_depth + 1;
+  q->passed_det    = passed_det;
+  q->n_fuzz        = 1;
+  q->queue_id      = queued_paths;
+  q->discovered_at = get_cur_time();
+  q->det_mode      = DET_SKIP;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -832,7 +923,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   }
 
-  last_path_time = get_cur_time();
+  last_path_time = q->discovered_at;
+  lin_cache_valid = 0;
 
 }
 
@@ -1255,25 +1347,22 @@ static void minimize_bits(u8* dst, u8* src) {
 }
 
 /* Determine the current state of the seed pool */
-static u8 determine_state() {
-  struct queue_entry* q = queue;
-  u8 has_unfuzzed_favored = 0, has_unfuzzed_nonfavored = 0;
+/* Using pending_favored and pending_not_fuzzed */
+static inline u8 determine_state(void) {
 
-  while (q) {
-    if (q->favored && q->fuzz_level == 0) has_unfuzzed_favored = 1;
-    if (!q->favored && q->fuzz_level == 0) has_unfuzzed_nonfavored = 1;
-    q = q->next;
-  }
+  /* pending_favored is the number of unfuzzed favored seeds.
+     pending_not_fuzzed is the number of all unfuzzed seeds. */
 
-  if (has_unfuzzed_favored) return 1; // Exploration state
-  if (!has_unfuzzed_favored && has_unfuzzed_nonfavored) return 2; // Search state
-  return 3; // Evaluation state
+  if (pending_favored) return 1;      /* Exploration state */
+  if (pending_not_fuzzed) return 2;   /* Search state      */
+  return 3;                           /* Evaluation state  */
+
 }
 
 
 /* Check domination based on current state and objective functions */
 static int is_dominated(struct queue_entry* a, struct queue_entry* b, u8 state) {
-  // Retrieve objective values for both entries
+
   u32 a_fuzz_level = a->fuzz_level;
   u32 b_fuzz_level = b->fuzz_level;
   u64 a_fuzz_p2 = next_p2(a->n_fuzz);
@@ -1282,86 +1371,86 @@ static int is_dominated(struct queue_entry* a, struct queue_entry* b, u8 state) 
   u64 b_fav_factor = b->exec_us * b->len;
   u32 a_depth = a->depth;
   u32 b_depth = b->depth;
+  u32 a_risk_hit = 0, b_risk_hit = 0;
+  u32 i;
 
-  if (!risk_awareness)
-  {
-    // Define domination conditions based on state
-    if (state == 1)  // Exploration state
-    {
-      int b_better = (b_fuzz_level <= a_fuzz_level &&
-                      b_fav_factor <= a_fav_factor &&
-                      b_depth >= a_depth);
-      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
-                              b_fav_factor < a_fav_factor ||
-                              b_depth > a_depth);
-      return b_better && b_strictly_better;
-    }
-    else if (state == 2)  // Search state
-    {
-      int b_better = (b_fuzz_level <= a_fuzz_level &&
-                      b_fuzz_p2 <= a_fuzz_p2 &&
-                      b_fav_factor <= a_fav_factor &&
-                      b_depth >= a_depth);
-      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
-                              b_fuzz_p2 < a_fuzz_p2 ||
-                              b_fav_factor < a_fav_factor ||
-                              b_depth > a_depth);
-      return b_better && b_strictly_better;
-    }
-    else  // Evaluation state
-    {
-      int b_better = (b_fuzz_level <= a_fuzz_level &&
-                      b_fuzz_p2 <= a_fuzz_p2 &&
-                      b_depth >= a_depth);
-      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
-                              b_fuzz_p2 < a_fuzz_p2 ||
-                              b_depth > a_depth);
-      return b_better && b_strictly_better;
+  if (risk_awareness) {
+    for (i = 0; i < hot_array; ++i) {
+      a_risk_hit += a->hot_hits ? a->hot_hits[i] : 0;
+      b_risk_hit += b->hot_hits ? b->hot_hits[i] : 0;
     }
   }
-  else
+
+  if (!risk_awareness) {
+
+    if (state == 1) {
+      int b_better = (b_fuzz_level <= a_fuzz_level &&
+                      b_fav_factor <= a_fav_factor &&
+                      b_depth >= a_depth);
+      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
+                               b_fav_factor < a_fav_factor ||
+                               b_depth > a_depth);
+      return b_better && b_strictly_better;
+    }
+
+    if (state == 2) {
+      int b_better = (b_fuzz_level <= a_fuzz_level &&
+                      b_fuzz_p2 <= a_fuzz_p2 &&
+                      b_fav_factor <= a_fav_factor &&
+                      b_depth >= a_depth);
+      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
+                               b_fuzz_p2 < a_fuzz_p2 ||
+                               b_fav_factor < a_fav_factor ||
+                               b_depth > a_depth);
+      return b_better && b_strictly_better;
+    }
+
+    {
+      int b_better = (b_fuzz_level <= a_fuzz_level &&
+                      b_fuzz_p2 <= a_fuzz_p2 &&
+                      b_depth >= a_depth);
+      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
+                               b_fuzz_p2 < a_fuzz_p2 ||
+                               b_depth > a_depth);
+      return b_better && b_strictly_better;
+    }
+
+  }
+
+  if (state == 1) {
+    int b_better = (b_fuzz_level <= a_fuzz_level &&
+                    b_fav_factor <= a_fav_factor &&
+                    b_depth >= a_depth &&
+                    b_risk_hit >= a_risk_hit);
+    int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
+                             b_fav_factor < a_fav_factor ||
+                             b_depth > a_depth ||
+                             b_risk_hit > a_risk_hit);
+    return b_better && b_strictly_better;
+  }
+
+  if (state == 2) {
+    int b_better = (b_fuzz_level <= a_fuzz_level &&
+                    b_fuzz_p2 <= a_fuzz_p2 &&
+                    b_fav_factor <= a_fav_factor &&
+                    b_depth >= a_depth);
+    int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
+                             b_fuzz_p2 < a_fuzz_p2 ||
+                             b_fav_factor < a_fav_factor ||
+                             b_depth > a_depth);
+    return b_better && b_strictly_better;
+  }
+
   {
-    u32* a_hot_hits = a->hot_hits;
-    u32* b_hot_hits = b->hot_hits;
-    u32 a_risk_hit = a_hot_hits[0] + a_hot_hits[1] + a_hot_hits[2];
-    u32 b_risk_hit = b_hot_hits[0] + b_hot_hits[1] + b_hot_hits[2];
-    // Define domination conditions based on state
-    if (state == 1)  // Exploration state
-    {
-      int b_better = (b_fuzz_level <= a_fuzz_level &&
-                      b_fav_factor <= a_fav_factor &&
-                      b_depth >= a_depth &&
-                      b_risk_hit >= a_risk_hit);
-      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
-                              b_fav_factor < a_fav_factor ||
-                              b_depth > a_depth ||
-                              b_risk_hit > a_risk_hit);
-      return b_better && b_strictly_better;
-    }
-    else if (state == 2)  // Search state
-    {
-      int b_better = (b_fuzz_level <= a_fuzz_level &&
-                      b_fuzz_p2 <= a_fuzz_p2 &&
-                      b_fav_factor <= a_fav_factor &&
-                      b_depth >= a_depth);
-      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
-                              b_fuzz_p2 < a_fuzz_p2 ||
-                              b_fav_factor < a_fav_factor ||
-                              b_depth > a_depth);
-      return b_better && b_strictly_better;
-    }
-    else  // Evaluation state
-    {
-      int b_better = (b_fuzz_level <= a_fuzz_level &&
-                      b_fuzz_p2 <= a_fuzz_p2 &&
-                      b_risk_hit >= a_risk_hit &&
-                      b_depth >= a_depth);
-      int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
-                              b_fuzz_p2 < a_fuzz_p2 ||
-                              b_risk_hit > a_risk_hit ||
-                              b_depth > a_depth);
-      return b_better && b_strictly_better;
-    }
+    int b_better = (b_fuzz_level <= a_fuzz_level &&
+                    b_fuzz_p2 <= a_fuzz_p2 &&
+                    b_risk_hit >= a_risk_hit &&
+                    b_depth >= a_depth);
+    int b_strictly_better = (b_fuzz_level < a_fuzz_level ||
+                             b_fuzz_p2 < a_fuzz_p2 ||
+                             b_risk_hit > a_risk_hit ||
+                             b_depth > a_depth);
+    return b_better && b_strictly_better;
   }
 }
 
@@ -1465,7 +1554,513 @@ static void cull_queue(void) {
   }
 }
 
+/* LinUCB assistant functions */
+static inline double lin_clamp(double v, double lo, double hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
 
+static inline u32 cksum_slot(u32 cksum) {
+  return cksum & (CKSUM_HT_SIZE - 1);
+}
+
+static void register_cksum_entry(struct queue_entry* q) {
+
+  u32 slot;
+
+  if (!q || !q->exec_cksum || q->cksum_registered) return;
+
+  slot = cksum_slot(q->exec_cksum);
+  q->next_cksum = cksum_heads[slot];
+  cksum_heads[slot] = q;
+  q->cksum_registered = 1;
+
+}
+
+static inline void update_path_frequency_fast(u32 cksum) {
+
+  struct queue_entry* q = cksum_heads[cksum_slot(cksum)];
+
+  while (q) {
+    if (q->exec_cksum == cksum) q->n_fuzz++;
+    q = q->next_cksum;
+  }
+
+}
+
+static void rebuild_cksum_index(void) {
+
+  struct queue_entry* q = queue;
+
+  memset(cksum_heads, 0, sizeof(cksum_heads));
+
+  while (q) {
+    q->cksum_registered = 0;
+    q->next_cksum = NULL;
+    if (q->exec_cksum) register_cksum_entry(q);
+    q = q->next;
+  }
+
+}
+
+static void linucb_init_model(struct linucb_model* m, double alpha) {
+
+  u32 i, j;
+
+  memset(m, 0, sizeof(*m));
+  m->alpha = alpha;
+
+  for (i = 0; i < LIN_DIM; i++)
+    for (j = 0; j < LIN_DIM; j++)
+      m->a_inv[i][j] = (i == j) ? 1.0 : 0.0;
+
+}
+
+static void reset_lin_runtime_state(void) {
+  memset(&lin_ep, 0, sizeof(lin_ep));
+  lin_mode_active = 0;
+  lin_selected_state = 0;
+  lin_cycle_budget = 0;
+  lin_topk_cnt = 0;
+  lin_select_since_rebuild = 0;
+  lin_cached_state = 0;
+  lin_last_rebuild_queued_paths = 0;
+  lin_cache_valid = 0;
+  lin_seed_burst_left = 0;
+}
+
+static void init_linucb_models(void) {
+  linucb_init_model(&lin_models[0], LIN_ALPHA_STATE1);
+  linucb_init_model(&lin_models[1], LIN_ALPHA_STATE2);
+  linucb_init_model(&lin_models[2], LIN_ALPHA_STATE3);
+  reset_lin_runtime_state();
+}
+
+static inline double seed_risk_score(const struct queue_entry* q) {
+  u32 i, sum = 0;
+  if (!risk_awareness || !q->hot_hits) return 0.0;
+  for (i = 0; i < hot_array; ++i) sum += q->hot_hits[i];
+  return (double)sum;
+}
+
+static struct queue_entry* select_state1_seed(u32* out_idx) {
+  struct queue_entry *q = queue, *best = NULL;
+  u32 idx = 0, best_idx = 0;
+
+  while (q) {
+    if (!q->cal_failed && q->favored && q->fuzz_level == 0) {
+      if (!best ||
+          q->has_new_cov > best->has_new_cov ||
+          (q->has_new_cov == best->has_new_cov && q->bitmap_size > best->bitmap_size) ||
+          (q->has_new_cov == best->has_new_cov && q->bitmap_size == best->bitmap_size &&
+           q->exec_us < best->exec_us)) {
+        best = q;
+        best_idx = idx;
+      }
+    }
+    q = q->next;
+    idx++;
+  }
+
+  if (!best) {
+    best = queue;
+    best_idx = 0;
+  }
+
+  if (out_idx) *out_idx = best_idx;
+  return best;
+}
+
+static s64 cheap_state2_score(const struct queue_entry* q) {
+  s64 score = 0;
+  score += q->has_new_cov ? 1000 : 0;
+  score += q->favored ? 500 : 0;
+  score += (s64)MIN(q->depth, 32ULL) * 20;
+  score += (s64)MIN(q->bitmap_size, 4096U);
+  score -= (s64)MIN((u64)(q->exec_us / 50), 1000ULL);
+  score -= (s64)MIN(q->n_fuzz, 1024ULL);
+  return score;
+}
+
+static struct queue_entry* select_state2_seed(u32* out_idx) {
+  struct queue_entry *q = queue, *best = NULL;
+  s64 best_score = -0x7fffffffffffffffLL;
+  u32 idx = 0, best_idx = 0;
+
+  while (q) {
+    if (!q->cal_failed && q->fuzz_level == 0) {
+      s64 score = cheap_state2_score(q);
+      if (!best || score > best_score) {
+        best = q;
+        best_score = score;
+        best_idx = idx;
+      }
+    }
+    q = q->next;
+    idx++;
+  }
+
+  if (!best) {
+    best = queue;
+    best_idx = 0;
+  }
+
+  if (out_idx) *out_idx = best_idx;
+  return best;
+}
+
+static void extract_seed_features(const struct queue_entry* q,
+                                  u8 state,
+                                  double x[LIN_DIM]) {
+
+  double avg_exec_us = total_cal_cycles
+                     ? (double)total_cal_us / (double)total_cal_cycles
+                     : 1.0;
+
+  double avg_bitmap = total_bitmap_entries
+                    ? (double)total_bitmap_size / (double)total_bitmap_entries
+                    : 1.0;
+
+  double speed_ratio = avg_exec_us / (double)MAX(q->exec_us, 1ULL);
+  double cov_ratio   = (double)q->bitmap_size / avg_bitmap;
+  double rarity      = 1.0 / (1.0 + log((double)q->n_fuzz + 1.0));
+  double risk        = seed_risk_score(q) / 16.0;
+  double freshness   = 0.0;
+  u64 age_ms = get_cur_time() - q->discovered_at;
+
+  if (age_ms < 10ULL * 60 * 1000) freshness = 1.0;
+  else if (age_ms < 60ULL * 60 * 1000) freshness = 0.5;
+
+  speed_ratio = lin_clamp(speed_ratio, 0.0, 4.0);
+  cov_ratio   = lin_clamp(cov_ratio,   0.0, 4.0);
+  risk        = lin_clamp(risk,        0.0, 1.0);
+
+  x[0]  = 1.0;
+  x[1]  = q->favored ? 1.0 : 0.0;
+  x[2]  = (q->fuzz_level == 0) ? 1.0 : 0.0;
+  x[3]  = (double)MIN(q->depth, 32ULL) / 32.0;
+  x[4]  = speed_ratio / 4.0;
+  x[5]  = cov_ratio / 4.0;
+  x[6]  = rarity;
+  x[7]  = q->has_new_cov ? 1.0 : 0.0;
+  x[8]  = risk;
+  x[9]  = (double)MIN(q->handicap, 8ULL) / 8.0;
+  x[10] = (double)MIN(cycles_wo_finds, 8ULL) / 8.0;
+  x[11] = freshness;
+  x[12] = (state == 1) ? 0.0 : ((state == 2) ? 0.5 : 1.0);
+
+}
+
+static double linucb_score_seed(struct linucb_model* m,
+                                const double x[LIN_DIM],
+                                double* mean_out) {
+
+  double mean = 0.0;
+  double ax[LIN_DIM];
+  double quad = 0.0;
+  u32 i, j;
+
+  for (i = 0; i < LIN_DIM; i++) mean += m->theta[i] * x[i];
+
+  for (i = 0; i < LIN_DIM; i++) {
+    ax[i] = 0.0;
+    for (j = 0; j < LIN_DIM; j++) ax[i] += m->a_inv[i][j] * x[j];
+  }
+
+  for (i = 0; i < LIN_DIM; i++) quad += x[i] * ax[i];
+
+  if (mean_out) *mean_out = mean;
+  return mean + m->alpha * sqrt(MAX(quad, 0.0));
+}
+
+static void linucb_update(struct linucb_model* m,
+                          const double x[LIN_DIM],
+                          double reward) {
+
+  double ax[LIN_DIM];
+  double denom = 1.0;
+  u32 i, j;
+
+  for (i = 0; i < LIN_DIM; i++) {
+    ax[i] = 0.0;
+    for (j = 0; j < LIN_DIM; j++) ax[i] += m->a_inv[i][j] * x[j];
+    denom += x[i] * ax[i];
+  }
+
+  if (denom <= 0.0) denom = 1.0;
+
+  for (i = 0; i < LIN_DIM; i++)
+    for (j = 0; j < LIN_DIM; j++)
+      m->a_inv[i][j] -= (ax[i] * ax[j]) / denom;
+
+  for (i = 0; i < LIN_DIM; i++) m->b[i] += reward * x[i];
+
+  for (i = 0; i < LIN_DIM; i++) {
+    double acc = 0.0;
+    for (j = 0; j < LIN_DIM; j++) acc += m->a_inv[i][j] * m->b[j];
+    m->theta[i] = acc;
+  }
+
+  m->pulls++;
+}
+
+static inline u8 lin_candidate_allowed(const struct queue_entry* q,
+                                       u8 state,
+                                       u32 idx) {
+
+  if (!q || q->cal_failed) return 0;
+
+  if (state == 1) return q->favored && q->fuzz_level == 0;
+  if (state == 2) return q->fuzz_level == 0;
+
+  if (q->favored || q->has_new_cov) return 1;
+  if (q->fuzz_level <= 1) return 1;
+
+  return (((idx + q->queue_id + queue_cycle) &
+           (LIN_STAGE3_STRIDE - 1)) == 0);
+}
+
+static void rebuild_lin_cache(u8 state) {
+
+  struct queue_entry* q = queue;
+  u32 idx = 0;
+  lin_topk_cnt = 0;
+
+  while (q) {
+
+    if (lin_candidate_allowed(q, state, idx)) {
+
+      double x[LIN_DIM], mean = 0.0, score;
+      u32 pos, worst = 0;
+
+      extract_seed_features(q, state, x);
+      score = linucb_score_seed(&lin_models[state - 1], x, &mean);
+
+      if (!q->lin_selects) score += LIN_FRESH_BONUS;
+      score += 0.10 * q->lin_reward_ema;
+
+      if (lin_topk_cnt < LIN_TOPK) {
+
+        lin_topk[lin_topk_cnt].q = q;
+        lin_topk[lin_topk_cnt].score = score;
+        lin_topk_cnt++;
+
+      } else {
+
+        for (pos = 1; pos < LIN_TOPK; ++pos)
+          if (lin_topk[pos].score < lin_topk[worst].score) worst = pos;
+
+        if (score > lin_topk[worst].score) {
+          lin_topk[worst].q = q;
+          lin_topk[worst].score = score;
+        }
+      }
+    }
+
+    q = q->next;
+    idx++;
+  }
+
+  lin_cached_state = state;
+  lin_select_since_rebuild = 0;
+  lin_last_rebuild_queued_paths = queued_paths;
+  lin_cache_valid = 1;
+}
+
+static struct queue_entry* select_next_seed_linucb(u32* out_idx,
+                                                   u8* out_state) {
+
+  u8 state = determine_state();
+
+  if (state == 1) {
+    if (out_state) *out_state = state;
+    return select_state1_seed(out_idx);
+  }
+
+  if (state == 2) {
+    if (out_state) *out_state = state;
+    return select_state2_seed(out_idx);
+  }
+
+  if (!lin_cache_valid || lin_cached_state != state ||
+      lin_select_since_rebuild >= LIN_REBUILD_INTERVAL ||
+      lin_last_rebuild_queued_paths != queued_paths) {
+    rebuild_lin_cache(state);
+  }
+
+  if (lin_topk_cnt) {
+    u32 i, pick = 0;
+    double best_score = -1e100;
+    struct queue_entry* best;
+    u32 idx = 0, best_idx = 0;
+    struct queue_entry* q;
+
+    for (i = 0; i < lin_topk_cnt; ++i) {
+      if (!lin_topk[i].q) continue;
+      if (lin_topk[i].score > best_score) {
+        best_score = lin_topk[i].score;
+        pick = i;
+      }
+    }
+
+    best = lin_topk[pick].q;
+    q = queue;
+    while (q && q != best) {
+      q = q->next;
+      idx++;
+    }
+    best_idx = q ? idx : 0;
+
+    if (best) {
+      double x[LIN_DIM], mean = 0.0;
+      extract_seed_features(best, state, x);
+      best->lin_last_ucb = linucb_score_seed(&lin_models[state - 1], x, &mean);
+      best->lin_last_mean = mean;
+      lin_select_since_rebuild++;
+      if (out_idx) *out_idx = best_idx;
+      if (out_state) *out_state = state;
+      return best;
+    }
+  }
+
+  if (out_idx) *out_idx = 0;
+  if (out_state) *out_state = state;
+  return queue;
+}
+
+static void linucb_begin_episode(struct queue_entry* q, u8 state) {
+
+  memset(&lin_ep, 0, sizeof(lin_ep));
+
+  lin_ep.seed = q;
+  lin_ep.state = state;
+  lin_ep.active = 1;
+
+  lin_ep.before_queued_paths     = queued_paths;
+  lin_ep.before_queued_with_cov  = queued_with_cov;
+  lin_ep.before_unique_crashes   = unique_crashes;
+  lin_ep.before_unique_hangs     = unique_hangs;
+  lin_ep.before_total_execs      = total_execs;
+  lin_ep.perf_score              = 0;
+
+  extract_seed_features(q, state, lin_ep.x);
+}
+
+static double compute_lin_reward(const struct queue_entry* q,
+                                 u8 state,
+                                 u64 exec_delta) {
+
+  double new_paths = (double)(queued_paths - lin_ep.before_queued_paths);
+  double new_cov   = (double)(queued_with_cov - lin_ep.before_queued_with_cov);
+  double new_crash = (double)(unique_crashes - lin_ep.before_unique_crashes);
+  double new_hang  = (double)(unique_hangs - lin_ep.before_unique_hangs);
+  double rarity    = 1.0 / (1.0 + log((double)MAX(q->n_fuzz, 1ULL)));
+  double cost      = log(1.0 + (double)MAX(exec_delta, 1ULL));
+  double reward    = 0.0;
+
+  switch (state) {
+
+    case 1:
+      reward = 3.0 * new_paths +
+               1.0 * new_cov +
+               4.5 * new_crash +
+               2.0 * new_hang +
+               0.8 * rarity -
+               0.20 * cost;
+      break;
+
+    case 2:
+      reward = 2.0 * new_paths +
+               0.7 * new_cov +
+               3.5 * new_crash +
+               1.5 * new_hang +
+               0.6 * rarity -
+               0.25 * cost;
+      break;
+
+    default:
+      reward = 1.2 * new_paths +
+               0.4 * new_cov +
+               4.0 * new_crash +
+               2.5 * new_hang +
+               1.0 * rarity -
+               0.30 * cost;
+      break;
+
+  }
+
+  return lin_clamp(reward, -1.0, LIN_REWARD_CLAMP);
+}
+
+static void linucb_finish_episode(void) {
+
+  struct queue_entry* q;
+  double reward;
+  u64 exec_delta;
+
+  if (!lin_ep.active || !lin_ep.seed) return;
+
+  q = lin_ep.seed;
+  exec_delta = total_execs - lin_ep.before_total_execs;
+  reward = compute_lin_reward(q, lin_ep.state, exec_delta);
+
+  linucb_update(&lin_models[lin_ep.state - 1], lin_ep.x, reward);
+
+  q->lin_selects++;
+  q->lin_last_reward = reward;
+
+  if (q->lin_selects == 1) q->lin_reward_ema = reward;
+  else q->lin_reward_ema = 0.80 * q->lin_reward_ema + 0.20 * reward;
+
+  lin_ep.active = 0;
+  lin_ep.seed = NULL;
+}
+
+static void linucb_abort_episode(void) {
+  lin_ep.active = 0;
+  lin_ep.seed = NULL;
+}
+
+static double linucb_energy_multiplier(const struct queue_entry* q, u8 state) {
+
+  double x[LIN_DIM], mean = 0.0, ucb, bonus;
+
+  extract_seed_features(q, state, x);
+  ucb = linucb_score_seed(&lin_models[state - 1], x, &mean);
+
+  bonus = 0.60 * mean +
+          0.20 * (ucb - mean) +
+          0.20 * q->lin_reward_ema;
+
+  bonus = lin_clamp(bonus, -1.0, 2.0);
+
+  if (state == 1) return lin_clamp(1.0 + 0.60 * bonus, 0.60, 2.00);
+  if (state == 2) return lin_clamp(1.0 + 0.50 * bonus, 0.70, 1.80);
+  return lin_clamp(1.0 + 0.35 * bonus, 0.80, 1.50);
+}
+
+static u8 lin_det_mode(const struct queue_entry* q, u32 perf_score, u8 state) {
+
+  u64 elapsed = get_cur_time() - start_time;
+
+  if (skip_deterministic || q->passed_det) return DET_SKIP;
+  if (state == 3) return DET_SKIP;
+
+  if (elapsed < 30ULL * 60 * 1000) {
+    if (state == 1 && q->len <= 1024) return DET_FULL;
+    if (state == 1 && q->len <= 4096) return DET_LIGHT;
+    if (state == 2 && q->len <= 2048 && perf_score >= 150) return DET_LIGHT;
+    return DET_SKIP;
+  }
+
+  if (q->recent_found && q->favored && q->len <= 1024) return DET_FULL;
+  if (q->favored && perf_score >= 200 && q->len <= 4096) return DET_LIGHT;
+
+  if (q->det_attempts >= 3 && q->det_finds == 0) return DET_SKIP;
+
+  return DET_SKIP;
+}
 
 /* Configure shared memory and virgin_bits. This is called at startup. */
 
@@ -2772,8 +3367,8 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if(risk_awareness)
   {
     int _i = 0;
-    q->hot_hits = ck_alloc(hot_array);
-    memset(q->hot_hits, 0, sizeof(hot_array));
+    if (!q->hot_hits) q->hot_hits = ck_alloc(hot_array);
+    memset(q->hot_hits, 0, hot_array);
 
     for (_i = 0; _i < hot_array; _i++)
     {
@@ -2785,6 +3380,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   total_bitmap_entries++;
 
   update_bitmap_score(q);
+  register_cksum_entry(q);  // New added;
 
   /* If this case didn't result in new output from the instrumentation, tell
      parent. This is a non-critical problem, but something to warn the user
@@ -3302,6 +3898,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   u8  keeping = 0, res;
 
   /* Update path frequency. */
+  /*
   u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
 
   struct queue_entry* q = queue;
@@ -3312,6 +3909,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     q = q->next;
 
   }
+  */
+  /* Update path family frequency in O(bucket_size). 
+  Replacing the code above. */
+  u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+  update_path_frequency_fast(cksum);
 
   if (fault == crash_mode) {
 
@@ -3335,6 +3937,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 #endif /* ^!SIMPLE_FILES */
 
     add_to_queue(fn, len, 0);
+    queue_top->recent_found = 1;
 
     if (hnb == 2) {
       queue_top->has_new_cov = 1;
@@ -4832,7 +5435,11 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   /* This handles FAULT_ERROR for us: */
 
-  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+  {
+    u8 kept = save_if_interesting(argv, out_buf, len, fault);
+    queued_discovered += kept;
+    if (kept && queue_cur) queue_cur->recent_found = 1;
+  }
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
@@ -4885,38 +5492,21 @@ static u32 choose_block_len(u32 limit) {
 }
 
 
-void write_hot_hits_to_file(u8* q_name, u8* q_hot_hits, u32 size) {
-  char file_path[1024];
-  snprintf(file_path, sizeof(file_path), "%s/fuzz_progress.txt", out_dir);
-
-  FILE *file = fopen(file_path, "a");
-  if (file == NULL) {
-    perror("Failed to open file");
-    return;
-  }
-
-  fprintf(file, "Hot Hits: %s", q_name);
-  for (u32 i = 0; i < size; i++) {
-    fprintf(file, "%02x ", q_hot_hits[i]);
-  }
-  fprintf(file, "\n");
-
-  fclose(file);
-}
-
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
    go into config.h. */
-
 static u32 calculate_score(struct queue_entry* q) {
 
-  u32 avg_exec_us = total_cal_us / total_cal_cycles;
-  u32 avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
-  u32 perf_score = 100;
+  u32 avg_exec_us = total_cal_cycles
+                  ? (u32)(total_cal_us / total_cal_cycles)
+                  : 1;
 
-  /* Adjust score based on execution speed of this path, compared to the
-     global average. Multiplier ranges from 0.1x to 3x. Fast inputs are
-     less expensive to fuzz, so we're giving them more air time. */
+  u32 avg_bitmap_size = total_bitmap_entries
+                      ? (u32)(total_bitmap_size / total_bitmap_entries)
+                      : 1;
+
+  u32 perf_score = 100;
+  u64 age_ms = get_cur_time() - q->discovered_at;
 
   if (q->exec_us * 0.1 > avg_exec_us) perf_score = 10;
   else if (q->exec_us * 0.25 > avg_exec_us) perf_score = 25;
@@ -4926,88 +5516,75 @@ static u32 calculate_score(struct queue_entry* q) {
   else if (q->exec_us * 3 < avg_exec_us) perf_score = 200;
   else if (q->exec_us * 2 < avg_exec_us) perf_score = 150;
 
-  /* Adjust score based on bitmap size. The working theory is that better
-     coverage translates to better targets. Multiplier from 0.25x to 3x. */
-
   if (q->bitmap_size * 0.3 > avg_bitmap_size) perf_score *= 3;
   else if (q->bitmap_size * 0.5 > avg_bitmap_size) perf_score *= 2;
-  else if (q->bitmap_size * 0.75 > avg_bitmap_size) perf_score *= 1.5;
-  else if (q->bitmap_size * 3 < avg_bitmap_size) perf_score *= 0.25;
-  else if (q->bitmap_size * 2 < avg_bitmap_size) perf_score *= 0.5;
-  else if (q->bitmap_size * 1.5 < avg_bitmap_size) perf_score *= 0.75;
-
-  /* Adjust score based on handicap. Handicap is proportional to how late
-     in the game we learned about this path. Latecomers are allowed to run
-     for a bit longer until they catch up with the rest. */
+  else if (q->bitmap_size * 0.75 > avg_bitmap_size) perf_score = (u32)(perf_score * 1.5);
+  else if (q->bitmap_size * 3 < avg_bitmap_size) perf_score = MAX(1U, (u32)(perf_score * 0.25));
+  else if (q->bitmap_size * 2 < avg_bitmap_size) perf_score = MAX(1U, (u32)(perf_score * 0.5));
+  else if (q->bitmap_size * 1.5 < avg_bitmap_size) perf_score = MAX(1U, (u32)(perf_score * 0.75));
 
   if (q->handicap >= 4) {
-
     perf_score *= 4;
     q->handicap -= 4;
-
   } else if (q->handicap) {
-
     perf_score *= 2;
     q->handicap--;
-
   }
 
-  /* Final adjustment based on input depth, under the assumption that fuzzing
-     deeper test cases is more likely to reveal stuff that can't be
-     discovered with traditional fuzzers. */
-
   switch (q->depth) {
-
     case 0 ... 3:   break;
     case 4 ... 7:   perf_score *= 2; break;
     case 8 ... 13:  perf_score *= 3; break;
     case 14 ... 25: perf_score *= 4; break;
     default:        perf_score *= 5;
-
   }
 
-  if(risk_awareness && q->passed_det)
-  {
-    double priority_factor[3] = {1.1, 0.9, 0.4};
-    uint8_t k = 1.0;
-
-    for (int i = 0; i < 3; i++) {
-      if(q->hot_hits[i] > 0) {
-        
-        double weight = 1 - exp(-k * q->hot_hits[i]);
-        perf_score *= 1 + priority_factor[i] * weight;
-
+  if (risk_awareness && q->passed_det && q->hot_hits) {
+    static const double priority_factor[3] = { 1.1, 0.9, 0.4 };
+    const double k = 1.0;
+    u32 i;
+    for (i = 0; i < hot_array; i++) {
+      if (q->hot_hits[i] > 0) {
+        double weight = 1.0 - exp(-k * q->hot_hits[i]);
+        perf_score = (u32)(perf_score * (1.0 + priority_factor[i] * weight));
       }
     }
   }
 
-  u64 fuzz = q->n_fuzz;
-  u32 factor = 1;
-
-  if (q->fuzz_level < 16) {
-    factor = ((u32) (1 << q->fuzz_level)) / (fuzz == 0 ? 1 : fuzz); 
-  } else{
-    factor = MAX_FACTOR / (fuzz == 0 ? 1 : next_p2 (fuzz));
+  if (age_ms < 10ULL * 60 * 1000) {
+    perf_score = (u32)(perf_score * 1.30);
+  } else if (age_ms < 60ULL * 60 * 1000) {
+    perf_score = (u32)(perf_score * 1.10);
   }
 
-  if (factor > MAX_FACTOR) {
-    factor = MAX_FACTOR;
-  }
-
-  perf_score *= factor / POWER_BETA;
-
-  /* Make sure that we don't go over limit. */
-
-  if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
-
-  /* write q->hot_hits to file */
-  if (risk_awareness)
   {
-    write_hot_hits_to_file(q->fname, q->hot_hits, hot_array);
+    u64 fuzz = q->n_fuzz;
+    u32 factor;
+
+    if (q->fuzz_level < 16)
+      factor = ((u32)(1U << q->fuzz_level)) / (u32)(fuzz ? fuzz : 1);
+    else
+      factor = MAX_FACTOR / (u32)(fuzz ? next_p2(fuzz) : 1);
+
+    if (factor > MAX_FACTOR) factor = MAX_FACTOR;
+    perf_score = MAX(1U, (u32)(((u64)perf_score * factor) / POWER_BETA));
   }
+
+  if (q->n_fuzz > 64 && !q->has_new_cov)
+    perf_score = MAX(1U, (u32)(perf_score * 0.75));
+  if (q->n_fuzz > 256 && !q->has_new_cov)
+    perf_score = MAX(1U, (u32)(perf_score * 0.50));
+
+  if (lin_mode_active && lin_ep.active && lin_ep.seed == q) {
+    double mul = linucb_energy_multiplier(q, lin_ep.state);
+    perf_score = MAX(1U, (u32)((double)perf_score * mul));
+    lin_ep.perf_score = perf_score;
+  }
+
+  if (perf_score > HAVOC_MAX_MULT * 100)
+    perf_score = HAVOC_MAX_MULT * 100;
 
   return perf_score;
-
 }
 
 
@@ -5208,42 +5785,37 @@ static u8 fuzz_one(char** argv) {
   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
 
-  u8  ret_val = 1, doing_det = 0;
+  u8  ret_val = 1, doing_det = 0, det_mode = DET_FULL;
+  u64 det_orig_hit_cnt = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
 
+/* Avoiding skiping randomly now.*/
 #ifdef IGNORE_FINDS
-
-  /* In IGNORE_FINDS mode, skip any entries that weren't in the
-     initial data set. */
 
   if (queue_cur->depth > 1) return 1;
 
 #else
 
-  if (pending_favored) {
+  if (!lin_mode_active) {
 
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
+    if (pending_favored) {
 
-    if ((queue_cur->fuzz_level > 0 || !queue_cur->favored) &&
-        UR(100) < SKIP_TO_NEW_PROB) return 1;
+      if ((queue_cur->fuzz_level > 0 || !queue_cur->favored) &&
+          UR(100) < SKIP_TO_NEW_PROB) return 1;
 
-  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
+    } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
 
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
+      if (queue_cycle > 1 && !queue_cur->fuzz_level == 0) {
 
-    if (queue_cycle > 1 && !queue_cur->fuzz_level == 0) {
+        if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
 
-      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
+      } else {
 
-    } else {
+        if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
 
-      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
+      }
 
     }
 
@@ -5339,16 +5911,32 @@ static u8 fuzz_one(char** argv) {
 
   if (perf_score == 0 && queued_paths > 10) goto abandon_entry;
 
-  /* Skip right away if -d is given, if we have done deterministic fuzzing on
-     this entry ourselves (fuzz_level > 0), or if it has gone through deterministic
-     testing in earlier, resumed runs (passed_det). */
+  if (lin_mode_active) {
 
-  if (skip_deterministic || ((!queue_cur->passed_det)  
-        && perf_score < (
-              queue_cur->depth * 30 <= HAVOC_MAX_MULT * 100
-              ? queue_cur->depth * 30 
-              : HAVOC_MAX_MULT * 100)) || queue_cur->passed_det)
-    goto havoc_stage;
+    det_mode = lin_det_mode(queue_cur, perf_score, lin_ep.state);
+    queue_cur->det_mode = det_mode;
+
+    if (det_mode == DET_SKIP) goto havoc_stage;
+
+    if (!queue_cur->passed_det &&
+        perf_score < (
+          queue_cur->depth * 30 <= HAVOC_MAX_MULT * 100
+          ? queue_cur->depth * 30
+          : HAVOC_MAX_MULT * 100))
+      goto havoc_stage;
+
+  } else {
+
+    if (skip_deterministic || ((!queue_cur->passed_det)
+          && perf_score < (
+                queue_cur->depth * 30 <= HAVOC_MAX_MULT * 100
+                ? queue_cur->depth * 30
+                : HAVOC_MAX_MULT * 100)) || queue_cur->passed_det)
+      goto havoc_stage;
+
+    queue_cur->det_mode = DET_FULL;
+
+  }
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
      for this master instance. */
@@ -5357,6 +5945,7 @@ static u8 fuzz_one(char** argv) {
     goto havoc_stage;
 
   doing_det = 1;
+  det_orig_hit_cnt = queued_paths + unique_crashes;
 
   /*********************************************
    * SIMPLE BITFLIP (+dictionary construction) *
@@ -5690,6 +6279,7 @@ static u8 fuzz_one(char** argv) {
 
 skip_bitflip:
 
+  if (det_mode == DET_LIGHT) goto skip_interest;
   if (no_arith) goto skip_arith;
 
   /**********************
@@ -6320,6 +6910,12 @@ skip_extras:
 
 havoc_stage:
 
+  if (doing_det) {
+    queue_cur->det_attempts++;
+    if (queued_paths + unique_crashes > det_orig_hit_cnt)
+      queue_cur->det_finds++;
+  }
+
   stage_cur_byte = -1;
 
   /* The havoc stage mutation code is also invoked when splicing files; if the
@@ -6873,7 +7469,7 @@ abandon_entry:
      cycle and have not seen this entry before. */
 
   if (!stop_soon && !queue_cur->cal_failed && queue_cur->fuzz_level == 0) {
-    //queue_cur->was_fuzzed = 1;
+    queue_cur->was_fuzzed = 1;
     pending_not_fuzzed--;
     if (queue_cur->favored) pending_favored--;
   }
@@ -8306,9 +8902,11 @@ int main(int argc, char** argv) {
   else
     use_argv = argv + optind;
 
+  init_linucb_models();
   perform_dry_run(use_argv);
 
   cull_queue();
+  rebuild_cksum_index();
 
   show_init_stats();
 
@@ -8327,63 +8925,136 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
-  while (1) {
+  u8 lin_resume_warmup = resuming_fuzz ? 1 : 0; //Newly added;
+    while (1) {
 
     u8 skipped_fuzz;
+    u8 use_linucb = (!dumb_mode && queued_paths > 1 && !lin_resume_warmup);
 
     cull_queue();
 
-    if (!queue_cur) {
+    if (use_linucb) {
 
-      queue_cycle++;
-      current_entry     = 0;
-      cur_skipped_paths = 0;
-      queue_cur         = queue;
+      if (!lin_cycle_budget) {
 
-      while (seek_to) {
-        current_entry++;
-        seek_to--;
-        queue_cur = queue_cur->next;
+        queue_cycle++;
+        current_entry     = 0;
+        cur_skipped_paths = 0;
+        lin_cycle_budget  = queued_paths ? queued_paths : 1;
+
+        show_stats();
+
+        if (not_on_tty) {
+          ACTF("Entering LinUCB queue cycle %llu.", queue_cycle);
+          fflush(stdout);
+        }
+
+        if (queued_paths == prev_queued) {
+          if (use_splicing) cycles_wo_finds++;
+          else use_splicing = 1;
+        } else {
+          cycles_wo_finds = 0;
+        }
+
+        prev_queued = queued_paths;
+
+        if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
+          sync_fuzzers(use_argv);
+
       }
 
-      show_stats();
+      if (!queue_cur || !lin_seed_burst_left) {
 
-      if (not_on_tty) {
-        ACTF("Entering queue cycle %llu.", queue_cycle);
-        fflush(stdout);
+        queue_cur = select_next_seed_linucb(&current_entry, &lin_selected_state);
+
+        if (!queue_cur) {
+          queue_cur = queue;
+          current_entry = 0;
+          lin_selected_state = determine_state();
+        }
+
+        lin_seed_burst_left = LIN_BURST_MIN +
+                              UR(LIN_BURST_MAX - LIN_BURST_MIN + 1);
+
       }
 
-      /* If we had a full queue cycle with no new finds, try
-         recombination strategies next. */
+      lin_mode_active = 1;
+      linucb_begin_episode(queue_cur, lin_selected_state);
+      lin_cycle_budget--;
 
-      if (queued_paths == prev_queued) {
+    } else {
 
-        if (use_splicing) cycles_wo_finds++; else use_splicing = 1;
+      lin_mode_active = 0;
 
-      } else cycles_wo_finds = 0;
+      if (!queue_cur) {
 
-      prev_queued = queued_paths;
+        queue_cycle++;
+        current_entry     = 0;
+        cur_skipped_paths = 0;
+        queue_cur         = queue;
 
-      if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
-        sync_fuzzers(use_argv);
+        while (seek_to) {
+          current_entry++;
+          seek_to--;
+          queue_cur = queue_cur->next;
+        }
+
+        show_stats();
+
+        if (not_on_tty) {
+          ACTF("Entering queue cycle %llu.", queue_cycle);
+          fflush(stdout);
+        }
+
+        if (queued_paths == prev_queued) {
+
+          if (use_splicing) cycles_wo_finds++;
+          else use_splicing = 1;
+
+        } else {
+          cycles_wo_finds = 0;
+        }
+
+        prev_queued = queued_paths;
+
+        if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
+          sync_fuzzers(use_argv);
+
+      }
 
     }
 
     skipped_fuzz = fuzz_one(use_argv);
 
+    if (lin_mode_active) {
+      if (!skipped_fuzz && !stop_soon) linucb_finish_episode();
+      else linucb_abort_episode();
+    }
+
     if (!stop_soon && sync_id && !skipped_fuzz) {
-      
+
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
         sync_fuzzers(use_argv);
 
     }
 
     if (!stop_soon && exit_1) stop_soon = 2;
-
     if (stop_soon) break;
 
-    queue_cur = queue_cur->next;
-    current_entry++;
+    if (lin_mode_active) {
+
+      if (lin_seed_burst_left > 0) lin_seed_burst_left--;
+      else queue_cur = 0;
+
+    } else {
+
+      queue_cur = queue_cur->next;
+      current_entry++;
+
+      if (lin_resume_warmup && !queue_cur)
+        lin_resume_warmup = 0;
+
+    }
 
   }
 

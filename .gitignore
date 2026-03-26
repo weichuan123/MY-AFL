@@ -21,4 +21,4 @@ afl-llvm-rt.o
 
 
 .DS_Store
-cJson
+cJSON
